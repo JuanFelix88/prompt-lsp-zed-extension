@@ -5,10 +5,16 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const TextDocumentSyncKind = { Full: 1 };
-const CompletionItemKind = { File: 17, Folder: 19 };
+const CompletionItemKind = { File: 17, Folder: 19, Reference: 18 };
 const MarkupKind = { Markdown: "markdown" };
 
-const TOKEN_TYPES = ["promptFileReference", "promptMissingFileReference", "promptListItem"];
+const TOKEN_TYPES = [
+  "promptFileReference",
+  "promptMissingFileReference",
+  "promptListItem",
+  "promptHeadingReference",
+  "promptMissingHeadingReference",
+];
 const TOKEN_MODIFIERS = [];
 
 const EXCLUDED_DIRS = new Set([
@@ -79,11 +85,19 @@ function resolveInsideWorkspace(rel) {
   if (clean.includes("\0") || path.isAbsolute(clean)) return null;
 
   const absolute = clean ? path.resolve(workspaceRoot, clean) : workspaceRoot;
-  const rootCompare = process.platform === "win32" ? workspaceRoot.toLowerCase() : workspaceRoot;
-  const absoluteCompare = process.platform === "win32" ? absolute.toLowerCase() : absolute;
-  const rootWithSep = rootCompare.endsWith(path.sep) ? rootCompare : `${rootCompare}${path.sep}`;
+  const rootCompare =
+    process.platform === "win32" ? workspaceRoot.toLowerCase() : workspaceRoot;
+  const absoluteCompare =
+    process.platform === "win32" ? absolute.toLowerCase() : absolute;
+  const rootWithSep = rootCompare.endsWith(path.sep)
+    ? rootCompare
+    : `${rootCompare}${path.sep}`;
 
-  if (absoluteCompare !== rootCompare && !absoluteCompare.startsWith(rootWithSep)) return null;
+  if (
+    absoluteCompare !== rootCompare &&
+    !absoluteCompare.startsWith(rootWithSep)
+  )
+    return null;
   return absolute;
 }
 
@@ -114,11 +128,13 @@ function pathToUri(filePath) {
 function isPromptDocument(uri) {
   const filePath = uriToPath(uri)?.replaceAll("\\", "/").toLowerCase() ?? "";
   const fileName = filePath.split("/").pop() ?? "";
-  return fileName === "prompt.md"
-    || fileName === "prompts.md"
-    || filePath.endsWith(".prompt.md")
-    || filePath.endsWith(".prompts.md")
-    || filePath.endsWith(".prompt");
+  return (
+    fileName === "prompt.md" ||
+    fileName === "prompts.md" ||
+    filePath.endsWith(".prompt.md") ||
+    filePath.endsWith(".prompts.md") ||
+    filePath.endsWith(".prompt")
+  );
 }
 
 function getText(uri) {
@@ -143,6 +159,115 @@ function isPathChar(char) {
   return /[A-Za-z0-9._~+\/-]/.test(char);
 }
 
+function parseAtxHeading(line) {
+  const match = /^( {0,3})(#{1,6})(?:[ \t]+|$)(.*)$/.exec(line);
+  if (!match) return null;
+
+  const text = (match[3] ?? "")
+    .trim()
+    .replace(/[ \t]+#+[ \t]*$/, "")
+    .trim();
+  if (!text) return null;
+
+  return { level: match[2].length, text };
+}
+
+function scanHeadings(text) {
+  const headings = [];
+  const stack = [];
+  const lines = text.split(/\r?\n/);
+  let fence = null;
+
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex];
+    const fenceMatch = /^( {0,3})(`{3,}|~{3,})/.exec(line);
+    if (fenceMatch) {
+      const marker = fenceMatch[2];
+      if (!fence) {
+        fence = { char: marker[0], length: marker.length };
+      } else if (marker[0] === fence.char && marker.length >= fence.length) {
+        fence = null;
+      }
+      continue;
+    }
+    if (fence) continue;
+
+    const heading = parseAtxHeading(line);
+    if (!heading) continue;
+
+    stack.length = heading.level - 1;
+    stack[heading.level - 1] = heading.text;
+    const pathParts = stack.slice(0, heading.level).filter(Boolean);
+
+    headings.push({
+      ...heading,
+      line: lineIndex,
+      character: 0,
+      endCharacter: line.length,
+      pathParts,
+      pathText: pathParts.join(" > "),
+    });
+  }
+
+  return headings;
+}
+
+function normalizeHeadingPath(input) {
+  return (input ?? "")
+    .split(">")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .join(" > ");
+}
+
+function resolveHeadingReference(headings, referenceText) {
+  const target = normalizeHeadingPath(referenceText);
+  if (!target) return [];
+  return headings.filter((heading) => heading.pathText === target);
+}
+
+function headingReferencesInLine(line) {
+  const refs = [];
+  const regex = /\[([^\]\n]+)\]/g;
+  let match;
+
+  while ((match = regex.exec(line))) {
+    const start = match.index;
+    const end = start + match[0].length;
+    const previous = start > 0 ? line[start - 1] : "";
+    const next = line[end] ?? "";
+    const content = match[1].trim();
+
+    if (
+      !content ||
+      content === "x" ||
+      content === "X" ||
+      previous === "!" ||
+      next === "("
+    )
+      continue;
+
+    refs.push({
+      reference: match[0],
+      content,
+      start,
+      end,
+      contentStart: start + 1,
+      contentEnd: end - 1,
+    });
+  }
+
+  return refs;
+}
+
+function headingReferenceAt(line, character) {
+  return (
+    headingReferencesInLine(line).find(
+      (ref) => character >= ref.start && character <= ref.end,
+    ) ?? null
+  );
+}
+
 function tokenAt(line, character) {
   const regex = /(^|[^\w])@([A-Za-z0-9._~+\/-]+)/g;
   let match;
@@ -159,7 +284,7 @@ function tokenAt(line, character) {
   return null;
 }
 
-function completionContext(line, character) {
+function fileCompletionContext(line, character) {
   const before = line.slice(0, character);
   const at = before.lastIndexOf("@");
   if (at < 0) return null;
@@ -170,12 +295,45 @@ function completionContext(line, character) {
   const prefix = before.slice(at + 1);
   if ([...prefix].some((char) => !isPathChar(char))) return null;
 
-  return { prefix: normalizeRel(prefix), replaceStart: at + 1, replaceEnd: character };
+  return {
+    type: "file",
+    prefix: normalizeRel(prefix),
+    replaceStart: at + 1,
+    replaceEnd: character,
+  };
+}
+
+function headingCompletionContext(line, character) {
+  const before = line.slice(0, character);
+  const open = before.lastIndexOf("[");
+  if (open < 0 || before.lastIndexOf("]") > open) return null;
+
+  const previous = open > 0 ? before[open - 1] : "";
+  if (previous === "!") return null;
+
+  const prefix = before.slice(open + 1);
+  if (prefix.includes("[")) return null;
+
+  return {
+    type: "heading",
+    prefix,
+    replaceStart: open + 1,
+    replaceEnd: character,
+    hasClosingBracket: line[character] === "]",
+  };
+}
+
+function completionContext(line, character) {
+  return (
+    headingCompletionContext(line, character) ??
+    fileCompletionContext(line, character)
+  );
 }
 
 function scanWorkspaceIndex() {
   const now = Date.now();
-  if (workspaceIndex && now - workspaceIndexBuiltAt < INDEX_TTL_MS) return workspaceIndex;
+  if (workspaceIndex && now - workspaceIndexBuiltAt < INDEX_TTL_MS)
+    return workspaceIndex;
 
   const results = [];
   const queue = [{ abs: workspaceRoot, rel: "", depth: 0 }];
@@ -191,7 +349,11 @@ function scanWorkspaceIndex() {
       continue;
     }
 
-    entries.sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name));
+    entries.sort(
+      (a, b) =>
+        Number(b.isDirectory()) - Number(a.isDirectory()) ||
+        a.name.localeCompare(b.name),
+    );
 
     for (const entry of entries) {
       if (entry.isDirectory() && EXCLUDED_DIRS.has(entry.name)) continue;
@@ -253,7 +415,7 @@ function completionLabel(insertText) {
   return `../${parts.slice(-2).join("/")}${isDir ? "/" : ""}`;
 }
 
-function listCompletionItems(prefix) {
+function listFileCompletionItems(prefix) {
   const cleanPrefix = normalizeRel(prefix).toLowerCase();
   const index = scanWorkspaceIndex();
   const matches = [];
@@ -265,10 +427,12 @@ function listCompletionItems(prefix) {
   }
 
   matches.sort((a, b) => {
-    return a.score - b.score
-      || Number(b.entry.isDir) - Number(a.entry.isDir)
-      || a.entry.depth - b.entry.depth
-      || a.entry.insertText.localeCompare(b.entry.insertText);
+    return (
+      a.score - b.score ||
+      Number(b.entry.isDir) - Number(a.entry.isDir) ||
+      a.entry.depth - b.entry.depth ||
+      a.entry.insertText.localeCompare(b.entry.insertText)
+    );
   });
 
   const items = matches.slice(0, MAX_COMPLETIONS).map(({ entry }) => ({
@@ -289,15 +453,74 @@ function listCompletionItems(prefix) {
   };
 }
 
+function headingCompletionScore(heading, prefix) {
+  const cleanPrefix = normalizeHeadingPath(prefix).toLowerCase();
+  if (!cleanPrefix) return heading.level;
+
+  const pathText = heading.pathText.toLowerCase();
+  const text = heading.text.toLowerCase();
+
+  if (pathText.startsWith(cleanPrefix)) return 0;
+  if (text.startsWith(cleanPrefix)) return 1;
+  if (pathText.includes(cleanPrefix)) return 2;
+  return null;
+}
+
+function listHeadingCompletionItems(text, prefix, hasClosingBracket) {
+  const headings = scanHeadings(text);
+  const matches = [];
+
+  for (const heading of headings) {
+    const score = headingCompletionScore(heading, prefix);
+    if (score === null) continue;
+    matches.push({ heading, score });
+  }
+
+  matches.sort((a, b) => {
+    return (
+      a.score - b.score ||
+      a.heading.line - b.heading.line ||
+      a.heading.pathText.localeCompare(b.heading.pathText)
+    );
+  });
+
+  const items = matches.slice(0, MAX_COMPLETIONS).map(({ heading }, index) => ({
+    label: heading.pathText,
+    kind: CompletionItemKind.Reference,
+    detail: `heading · line ${heading.line + 1}`,
+    insertText: heading.pathText,
+    filterText: heading.pathText,
+    textEdit: {
+      range: null,
+      newText: hasClosingBracket ? heading.pathText : `${heading.pathText}]`,
+    },
+    sortText: `${index.toString().padStart(4, "0")}_${heading.pathText}`,
+  }));
+
+  return {
+    isIncomplete: matches.length > MAX_COMPLETIONS,
+    items,
+  };
+}
+
 function completion(params) {
-  if (!isPromptDocument(params.textDocument.uri)) return { isIncomplete: false, items: [] };
+  if (!isPromptDocument(params.textDocument.uri))
+    return { isIncomplete: false, items: [] };
 
   const text = getText(params.textDocument.uri);
   const line = getLine(text, params.position.line);
   const context = completionContext(line, params.position.character);
   if (!context) return { isIncomplete: false, items: [] };
 
-  const completions = listCompletionItems(context.prefix);
+  const completions =
+    context.type === "heading"
+      ? listHeadingCompletionItems(
+          text,
+          context.prefix,
+          context.hasClosingBracket,
+        )
+      : listFileCompletionItems(context.prefix);
+
   const items = completions.items.map((item) => ({
     ...item,
     textEdit: {
@@ -318,22 +541,48 @@ function hover(params) {
   const text = getText(params.textDocument.uri);
   const line = getLine(text, params.position.line);
   const token = tokenAt(line, params.position.character);
-  if (!token) return null;
+  if (token) {
+    const result = statReference(token.rel);
+    const exists = !!result?.stat;
+    const kind = result?.stat?.isDirectory() ? "folder" : "file";
 
-  const result = statReference(token.rel);
-  const exists = !!result?.stat;
-  const kind = result?.stat?.isDirectory() ? "folder" : "file";
+    return {
+      contents: {
+        kind: MarkupKind.Markdown,
+        value: exists
+          ? `\`@${token.rel}\`\n\nExists: ${kind}\n\n${result.absolute}`
+          : `\`@${token.rel}\`\n\nMissing file or folder in workspace.`,
+      },
+      range: {
+        start: { line: params.position.line, character: token.start },
+        end: { line: params.position.line, character: token.end },
+      },
+    };
+  }
+
+  const headingRef = headingReferenceAt(line, params.position.character);
+  if (!headingRef) return null;
+
+  const matches = resolveHeadingReference(
+    scanHeadings(text),
+    headingRef.content,
+  );
+  const target = matches[0];
+  const duplicateNote =
+    matches.length > 1
+      ? `\n\n${matches.length} matching headings; go-to-definition opens the first.`
+      : "";
 
   return {
     contents: {
       kind: MarkupKind.Markdown,
-      value: exists
-        ? `\`@${token.rel}\`\n\nExists: ${kind}\n\n${result.absolute}`
-        : `\`@${token.rel}\`\n\nMissing file or folder in workspace.`,
+      value: target
+        ? `\`${headingRef.reference}\`\n\nHeading reference → line ${target.line + 1}\n\n${target.pathText}${duplicateNote}`
+        : `\`${headingRef.reference}\`\n\nMissing heading in current document.`,
     },
     range: {
-      start: { line: params.position.line, character: token.start },
-      end: { line: params.position.line, character: token.end },
+      start: { line: params.position.line, character: headingRef.start },
+      end: { line: params.position.line, character: headingRef.end },
     },
   };
 }
@@ -344,18 +593,39 @@ function definition(params) {
   const text = getText(params.textDocument.uri);
   const line = getLine(text, params.position.line);
   const token = tokenAt(line, params.position.character);
-  if (!token) return null;
+  if (token) {
+    const result = statReference(token.rel);
+    if (!result?.stat) return null;
 
-  const result = statReference(token.rel);
-  if (!result?.stat) return null;
+    return {
+      uri: pathToUri(result.absolute),
+      range: {
+        start: { line: 0, character: 0 },
+        end: { line: 0, character: 0 },
+      },
+    };
+  }
+
+  const headingRef = headingReferenceAt(line, params.position.character);
+  if (!headingRef) return null;
+
+  const target = resolveHeadingReference(
+    scanHeadings(text),
+    headingRef.content,
+  )[0];
+  if (!target) return null;
 
   return {
-    uri: pathToUri(result.absolute),
+    uri: params.textDocument.uri,
     range: {
-      start: { line: 0, character: 0 },
-      end: { line: 0, character: 0 },
+      start: { line: target.line, character: target.character },
+      end: { line: target.line, character: target.endCharacter },
     },
   };
+}
+
+function rangesOverlap(a, b) {
+  return a.start < b.end && b.start < a.end;
 }
 
 function semanticTokens(params) {
@@ -364,12 +634,13 @@ function semanticTokens(params) {
   const text = getText(uri);
   const tokens = [];
   const lines = text.split(/\r?\n/);
+  const headings = promptDoc ? scanHeadings(text) : [];
 
   for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
     const line = lines[lineIndex];
 
-    // Ranges covered by @file references so list-item tokens can fill the
-    // gaps without overlapping them.
+    // Ranges covered by references so list-item tokens can fill the gaps
+    // without overlapping them.
     const refRanges = [];
     if (promptDoc) {
       const regex = /(^|[^\w])@([A-Za-z0-9._~+\/-]+)/g;
@@ -379,11 +650,31 @@ function semanticTokens(params) {
         const start = match.index + prefixLength;
         const length = 1 + match[2].length;
         const exists = !!statReference(match[2])?.stat;
-        refRanges.push({ start, end: start + length, tokenType: exists ? 0 : 1 });
+        refRanges.push({
+          start,
+          end: start + length,
+          tokenType: exists ? 0 : 1,
+        });
       }
+
+      for (const headingRef of headingReferencesInLine(line)) {
+        if (refRanges.some((range) => rangesOverlap(range, headingRef)))
+          continue;
+        const exists =
+          resolveHeadingReference(headings, headingRef.content).length > 0;
+        refRanges.push({
+          start: headingRef.start,
+          end: headingRef.end,
+          tokenType: exists ? 3 : 4,
+        });
+      }
+
+      refRanges.sort((a, b) => a.start - b.start || a.end - b.end);
     }
 
     // Hyphen list items: color from the marker to the end of the line.
+    // Only prompt docs; avoid leaking red list-item tokens into plain *.md.
+    if (!promptDoc) continue;
     const listMatch = /^(\s*)(-\s+)/.exec(line);
     if (listMatch) {
       const itemStart = listMatch[1].length;
@@ -392,18 +683,33 @@ function semanticTokens(params) {
         let cursor = itemStart;
         for (const ref of refRanges) {
           if (ref.start > cursor) {
-            tokens.push({ line: lineIndex, start: cursor, length: ref.start - cursor, tokenType: 2 });
+            tokens.push({
+              line: lineIndex,
+              start: cursor,
+              length: ref.start - cursor,
+              tokenType: 2,
+            });
           }
           cursor = Math.max(cursor, ref.end);
         }
         if (cursor < itemEnd) {
-          tokens.push({ line: lineIndex, start: cursor, length: itemEnd - cursor, tokenType: 2 });
+          tokens.push({
+            line: lineIndex,
+            start: cursor,
+            length: itemEnd - cursor,
+            tokenType: 2,
+          });
         }
       }
     }
 
     for (const ref of refRanges) {
-      tokens.push({ line: lineIndex, start: ref.start, length: ref.end - ref.start, tokenType: ref.tokenType });
+      tokens.push({
+        line: lineIndex,
+        start: ref.start,
+        length: ref.end - ref.start,
+        tokenType: ref.tokenType,
+      });
     }
   }
 
@@ -413,8 +719,10 @@ function semanticTokens(params) {
   let previousLine = 0;
   let previousStart = 0;
   for (const token of tokens) {
-    const deltaLine = data.length === 0 ? token.line : token.line - previousLine;
-    const deltaStart = deltaLine === 0 ? token.start - previousStart : token.start;
+    const deltaLine =
+      data.length === 0 ? token.line : token.line - previousLine;
+    const deltaStart =
+      deltaLine === 0 ? token.start - previousStart : token.start;
     data.push(deltaLine, deltaStart, token.length, token.tokenType, 0);
     previousLine = token.line;
     previousStart = token.start;
@@ -438,7 +746,7 @@ function initialize(params) {
     capabilities: {
       textDocumentSync: TextDocumentSyncKind.Full,
       completionProvider: {
-        triggerCharacters: ["@", "/"],
+        triggerCharacters: ["@", "/", "["],
         resolveProvider: false,
       },
       hoverProvider: true,
@@ -478,7 +786,10 @@ function handle(message) {
     }
 
     if (message.method === "textDocument/didOpen") {
-      documents.set(message.params.textDocument.uri, message.params.textDocument.text ?? "");
+      documents.set(
+        message.params.textDocument.uri,
+        message.params.textDocument.text ?? "",
+      );
       return;
     }
 
@@ -514,10 +825,12 @@ function handle(message) {
       return;
     }
 
-    if (message.id !== undefined) respondError(message.id, -32601, `Method not found: ${message.method}`);
+    if (message.id !== undefined)
+      respondError(message.id, -32601, `Method not found: ${message.method}`);
   } catch (error) {
     log(error?.stack ?? String(error));
-    if (message.id !== undefined) respondError(message.id, -32603, String(error?.message ?? error));
+    if (message.id !== undefined)
+      respondError(message.id, -32603, String(error?.message ?? error));
   }
 }
 

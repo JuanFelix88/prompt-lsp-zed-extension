@@ -7,12 +7,14 @@ Zed language extension for prompt-flavored Markdown files.
 - Activates on `*.prompt.md`, `*.prompt`, `*.prompts.md`.
 - Markdown syntax highlighting through Tree-sitter Markdown.
 - `@path/to/file.ts` references.
-- Completion after `@` and `/`.
-- Hover for existing/missing files.
+- Heading references with Obsidian-like syntax: `[Topic]` or `[Parent > Child]`.
+- Completion after `@`, `/`, and `[`.
+- Hover for existing/missing files and heading references.
 - Go-to-definition for existing references.
 - Semantic colors:
-  - existing references: blue/link style
-  - missing references: red underline
+  - existing file references: blue/link style
+  - missing references: error underline
+  - heading references: theme link/emphasis style
   - hyphen list items (`-`): red via semantic tokens
 
 ## Development install

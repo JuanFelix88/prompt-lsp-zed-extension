@@ -12,7 +12,15 @@
   },
   {
     "token_type": "promptListItem",
-    "style": ["string.special"],
-    "foreground_color": "#ff5f5f"
+    "style": ["string"]
+  },
+  {
+    "token_type": "promptHeadingReference",
+    "style": ["function.method", "function"]
+  },
+  {
+    "token_type": "promptMissingHeadingReference",
+    "style": ["error"],
+    "underline": true
   }
 ]
