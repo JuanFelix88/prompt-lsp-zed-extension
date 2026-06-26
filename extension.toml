@@ -1,0 +1,23 @@
+id = "prompt-lsp"
+name = "Markdown Prompt Lang"
+description = "Markdown Prompt language support with @file references, completions, hover, definition, and semantic highlighting."
+version = "0.2.2"
+schema_version = 1
+authors = ["Juan Andrade <andrade.juan@outlook.com.br>"]
+repository = "https://github.com/andrade-juan/prompt-lsp-zed-extension"
+
+[lib]
+kind = "Rust"
+version = "0.7.0"
+
+[language_servers.prompt-markdown-lsp]
+name = "Markdown Prompt LSP"
+languages = ["Markdown Prompt"]
+
+[language_servers.prompt-markdown-lsp.language_ids]
+"Markdown Prompt" = "markdown-prompt"
+
+[grammars.markdown]
+repository = "https://github.com/tree-sitter-grammars/tree-sitter-markdown"
+rev = "c3570720f7f7bbad22fe96603f106276618e0cf5"
+path = "tree-sitter-markdown"

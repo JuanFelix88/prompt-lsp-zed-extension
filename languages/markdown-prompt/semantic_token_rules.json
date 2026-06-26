@@ -1,0 +1,13 @@
+[
+  {
+    "token_type": "promptFileReference",
+    "style": ["link_uri", "string"],
+    "foreground_color": "#4ea1ff"
+  },
+  {
+    "token_type": "promptMissingFileReference",
+    "style": ["error"],
+    "foreground_color": "#ff5f5f",
+    "underline": true
+  }
+]

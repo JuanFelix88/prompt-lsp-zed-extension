@@ -1,0 +1,16 @@
+name = "Markdown Prompt"
+grammar = "markdown"
+path_suffixes = ["md", "prompt"]
+line_comments = ["> "]
+tab_size = 2
+hard_tabs = false
+word_characters = ["@", "/", ".", "-", "_"]
+completion_query_characters = ["@", "/", ".", "-", "_"]
+brackets = [
+  { start = "(", end = ")", close = true, newline = false },
+  { start = "[", end = "]", close = true, newline = false },
+  { start = "{", end = "}", close = true, newline = true },
+  { start = "`", end = "`", close = true, newline = false },
+  { start = "\"", end = "\"", close = true, newline = false },
+  { start = "'", end = "'", close = true, newline = false },
+]
