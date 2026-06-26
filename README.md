@@ -13,6 +13,7 @@ Zed language extension for prompt-flavored Markdown files.
 - Semantic colors:
   - existing references: blue/link style
   - missing references: red underline
+  - hyphen list items (`-`): red via semantic tokens
 
 ## Development install
 

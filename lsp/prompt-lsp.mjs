@@ -8,7 +8,7 @@ const TextDocumentSyncKind = { Full: 1 };
 const CompletionItemKind = { File: 17, Folder: 19 };
 const MarkupKind = { Markdown: "markdown" };
 
-const TOKEN_TYPES = ["promptFileReference", "promptMissingFileReference"];
+const TOKEN_TYPES = ["promptFileReference", "promptMissingFileReference", "promptListItem"];
 const TOKEN_MODIFIERS = [];
 
 const EXCLUDED_DIRS = new Set([
@@ -359,32 +359,65 @@ function definition(params) {
 }
 
 function semanticTokens(params) {
-  if (!isPromptDocument(params.textDocument.uri)) return { data: [] };
+  const uri = params.textDocument.uri;
+  const promptDoc = isPromptDocument(uri);
+  const text = getText(uri);
+  const tokens = [];
+  const lines = text.split(/\r?\n/);
 
-  const text = getText(params.textDocument.uri);
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex];
+
+    // Ranges covered by @file references so list-item tokens can fill the
+    // gaps without overlapping them.
+    const refRanges = [];
+    if (promptDoc) {
+      const regex = /(^|[^\w])@([A-Za-z0-9._~+\/-]+)/g;
+      let match;
+      while ((match = regex.exec(line))) {
+        const prefixLength = match[1].length;
+        const start = match.index + prefixLength;
+        const length = 1 + match[2].length;
+        const exists = !!statReference(match[2])?.stat;
+        refRanges.push({ start, end: start + length, tokenType: exists ? 0 : 1 });
+      }
+    }
+
+    // Hyphen list items: color from the marker to the end of the line.
+    const listMatch = /^(\s*)(-\s+)/.exec(line);
+    if (listMatch) {
+      const itemStart = listMatch[1].length;
+      const itemEnd = line.length;
+      if (itemEnd > itemStart) {
+        let cursor = itemStart;
+        for (const ref of refRanges) {
+          if (ref.start > cursor) {
+            tokens.push({ line: lineIndex, start: cursor, length: ref.start - cursor, tokenType: 2 });
+          }
+          cursor = Math.max(cursor, ref.end);
+        }
+        if (cursor < itemEnd) {
+          tokens.push({ line: lineIndex, start: cursor, length: itemEnd - cursor, tokenType: 2 });
+        }
+      }
+    }
+
+    for (const ref of refRanges) {
+      tokens.push({ line: lineIndex, start: ref.start, length: ref.end - ref.start, tokenType: ref.tokenType });
+    }
+  }
+
+  tokens.sort((a, b) => a.line - b.line || a.start - b.start);
+
   const data = [];
   let previousLine = 0;
   let previousStart = 0;
-
-  const lines = text.split(/\r?\n/);
-  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
-    const line = lines[lineIndex];
-    const regex = /(^|[^\w])@([A-Za-z0-9._~+\/-]+)/g;
-    let match;
-
-    while ((match = regex.exec(line))) {
-      const prefixLength = match[1].length;
-      const start = match.index + prefixLength;
-      const length = 1 + match[2].length;
-      const exists = !!statReference(match[2])?.stat;
-      const tokenType = exists ? 0 : 1;
-      const deltaLine = data.length === 0 ? lineIndex : lineIndex - previousLine;
-      const deltaStart = deltaLine === 0 ? start - previousStart : start;
-
-      data.push(deltaLine, deltaStart, length, tokenType, 0);
-      previousLine = lineIndex;
-      previousStart = start;
-    }
+  for (const token of tokens) {
+    const deltaLine = data.length === 0 ? token.line : token.line - previousLine;
+    const deltaStart = deltaLine === 0 ? token.start - previousStart : token.start;
+    data.push(deltaLine, deltaStart, token.length, token.tokenType, 0);
+    previousLine = token.line;
+    previousStart = token.start;
   }
 
   return { data };
