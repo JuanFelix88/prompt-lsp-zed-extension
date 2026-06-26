@@ -1,7 +1,7 @@
 id = "prompt-lsp"
 name = "Markdown Prompt Lang"
 description = "Markdown Prompt language support with @file references, completions, hover, definition, and semantic highlighting."
-version = "0.2.2"
+version = "0.3.1"
 schema_version = 1
 authors = ["Juan Andrade <andrade.juan@outlook.com.br>"]
 repository = "https://github.com/andrade-juan/prompt-lsp-zed-extension"

@@ -33,10 +33,16 @@ const EXCLUDED_DIRS = new Set([
   "vendor",
 ]);
 
-const MAX_COMPLETIONS = 250;
+const MAX_COMPLETIONS = 500;
+const MAX_INDEX_ENTRIES = 50_000;
+const INDEX_TTL_MS = 2_000;
+
 const documents = new Map();
 let workspaceRoot = readWorkspaceArg() ?? process.cwd();
 workspaceRoot = path.resolve(workspaceRoot);
+
+let workspaceIndex = null;
+let workspaceIndexBuiltAt = 0;
 
 function readWorkspaceArg() {
   const index = process.argv.indexOf("--workspace");
@@ -167,51 +173,120 @@ function completionContext(line, character) {
   return { prefix: normalizeRel(prefix), replaceStart: at + 1, replaceEnd: character };
 }
 
-function splitPrefix(prefix) {
-  if (!prefix) return { dirRel: "", needle: "" };
-  if (prefix.endsWith("/")) return { dirRel: prefix.slice(0, -1), needle: "" };
+function scanWorkspaceIndex() {
+  const now = Date.now();
+  if (workspaceIndex && now - workspaceIndexBuiltAt < INDEX_TTL_MS) return workspaceIndex;
 
-  const slash = prefix.lastIndexOf("/");
-  if (slash < 0) return { dirRel: "", needle: prefix };
-  return { dirRel: prefix.slice(0, slash), needle: prefix.slice(slash + 1) };
+  const results = [];
+  const queue = [{ abs: workspaceRoot, rel: "", depth: 0 }];
+  let truncated = false;
+
+  while (queue.length && results.length < MAX_INDEX_ENTRIES) {
+    const current = queue.shift();
+    let entries;
+
+    try {
+      entries = fs.readdirSync(current.abs, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+
+    entries.sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name));
+
+    for (const entry of entries) {
+      if (entry.isDirectory() && EXCLUDED_DIRS.has(entry.name)) continue;
+
+      const rel = normalizeRel(path.posix.join(current.rel, entry.name));
+      if (!rel) continue;
+
+      const isDir = entry.isDirectory();
+      results.push({
+        rel,
+        insertText: isDir ? `${rel}/` : rel,
+        name: entry.name,
+        isDir,
+        depth: current.depth + 1,
+      });
+
+      if (results.length >= MAX_INDEX_ENTRIES) {
+        truncated = true;
+        break;
+      }
+
+      if (isDir) {
+        queue.push({
+          abs: path.join(current.abs, entry.name),
+          rel,
+          depth: current.depth + 1,
+        });
+      }
+    }
+  }
+
+  workspaceIndex = { entries: results, truncated };
+  workspaceIndexBuiltAt = now;
+  return workspaceIndex;
+}
+
+function completionScore(entry, prefix) {
+  if (!prefix) return entry.depth;
+
+  const lowerPrefix = prefix.toLowerCase();
+  const lowerRel = entry.rel.toLowerCase();
+  const lowerName = entry.name.toLowerCase();
+  const lowerInsertText = entry.insertText.toLowerCase();
+
+  if (lowerInsertText.startsWith(lowerPrefix)) return 0;
+  if (!lowerPrefix.includes("/") && lowerName.startsWith(lowerPrefix)) return 1;
+  if (lowerRel.includes(`/${lowerPrefix}`)) return 2;
+  if (lowerRel.includes(lowerPrefix)) return 3;
+  return null;
+}
+
+function completionLabel(insertText) {
+  const isDir = insertText.endsWith("/");
+  const withoutTrailingSlash = isDir ? insertText.slice(0, -1) : insertText;
+  const parts = withoutTrailingSlash.split("/").filter(Boolean);
+
+  if (parts.length <= 2) return insertText;
+
+  return `../${parts.slice(-2).join("/")}${isDir ? "/" : ""}`;
 }
 
 function listCompletionItems(prefix) {
-  const { dirRel, needle } = splitPrefix(prefix);
-  const dirAbs = resolveInsideWorkspace(dirRel);
-  if (!dirAbs) return [];
+  const cleanPrefix = normalizeRel(prefix).toLowerCase();
+  const index = scanWorkspaceIndex();
+  const matches = [];
 
-  let entries;
-  try {
-    entries = fs.readdirSync(dirAbs, { withFileTypes: true });
-  } catch {
-    return [];
+  for (const entry of index.entries) {
+    const score = completionScore(entry, cleanPrefix);
+    if (score === null) continue;
+    matches.push({ entry, score });
   }
 
-  const lowerNeedle = needle.toLowerCase();
-  return entries
-    .filter((entry) => {
-      if (entry.isDirectory() && EXCLUDED_DIRS.has(entry.name)) return false;
-      return !lowerNeedle || entry.name.toLowerCase().startsWith(lowerNeedle);
-    })
-    .sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory()) || a.name.localeCompare(b.name))
-    .slice(0, MAX_COMPLETIONS)
-    .map((entry) => {
-      const rel = normalizeRel(path.posix.join(normalizeRel(dirRel), entry.name));
-      const isDir = entry.isDirectory();
-      const insertText = isDir ? `${rel}/` : rel;
-      return {
-        label: `@${insertText}`,
-        kind: isDir ? CompletionItemKind.Folder : CompletionItemKind.File,
-        detail: isDir ? "folder" : "file",
-        insertText,
-        textEdit: {
-          range: null,
-          newText: insertText,
-        },
-        sortText: `${isDir ? "0" : "1"}_${insertText}`,
-      };
-    });
+  matches.sort((a, b) => {
+    return a.score - b.score
+      || Number(b.entry.isDir) - Number(a.entry.isDir)
+      || a.entry.depth - b.entry.depth
+      || a.entry.insertText.localeCompare(b.entry.insertText);
+  });
+
+  const items = matches.slice(0, MAX_COMPLETIONS).map(({ entry }) => ({
+    label: completionLabel(entry.insertText),
+    kind: entry.isDir ? CompletionItemKind.Folder : CompletionItemKind.File,
+    detail: entry.isDir ? "folder" : "file",
+    insertText: entry.insertText,
+    textEdit: {
+      range: null,
+      newText: entry.insertText,
+    },
+    sortText: `${entry.isDir ? "0" : "1"}_${entry.depth.toString().padStart(4, "0")}_${entry.insertText}`,
+  }));
+
+  return {
+    isIncomplete: index.truncated || matches.length > MAX_COMPLETIONS,
+    items,
+  };
 }
 
 function completion(params) {
@@ -222,7 +297,8 @@ function completion(params) {
   const context = completionContext(line, params.position.character);
   if (!context) return { isIncomplete: false, items: [] };
 
-  const items = listCompletionItems(context.prefix).map((item) => ({
+  const completions = listCompletionItems(context.prefix);
+  const items = completions.items.map((item) => ({
     ...item,
     textEdit: {
       range: {
@@ -233,7 +309,7 @@ function completion(params) {
     },
   }));
 
-  return { isIncomplete: false, items };
+  return { isIncomplete: completions.isIncomplete, items };
 }
 
 function hover(params) {
